@@ -1,0 +1,4 @@
+#!/bin/sh
+
+exec ruby -e "$: << '.'; require 'lib/certificate_authority_cli.rb'" "$@"
+
