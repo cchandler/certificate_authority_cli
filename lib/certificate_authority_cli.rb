@@ -8,8 +8,10 @@ require 'highline/import'
 
 Log = Logger.new(STDOUT)
 
-GENERIC_SUBJECT = {"cn" => "", "ou" => ""}
+GENERIC_SUBJECT = {"cn" => "", "ou" => "", "l" => ""}
 NEW_ROOT_SETTINGS = {"subject" => GENERIC_SUBJECT, "modulus" => 2048, "cert_file" => "/tmp/ca.crt", "key_file" => "/tmp/ca.key"}
+NEW_CERT_SETTINGS = {"subject" => GENERIC_SUBJECT, "modulus" => 2048, "cert_file" => "/tmp/cert.crt", "key_file" => "/tmp/cert.key"}
+
 
 module CertificateAuthorityCli
   def self.get_password(prompt="Enter Password")
@@ -53,10 +55,13 @@ module CertificateAuthorityCli
 
         root = CertificateAuthority::Certificate.new
         root.subject.common_name= settings["subject"]["cn"]
+        root.subject.locality = settings["subject"]["l"] if settings["subject"]["l"]
+        root.subject.locality = settings["subject"]["ou"] if settings["subject"]["ou"]
         root.serial_number.number=1
         root.key_material.generate_key(settings["modulus"])
         root.signing_entity = true
         signing_profile = {"extensions" => {"keyUsage" => {"usage" => ["critical", "keyCertSign"] }} }
+        root.not_after = Time.now + 60 * 60 * 24 * 365 * 5 # 5 years
         root_cert = root.sign!(signing_profile)
 
         password = CertificateAuthorityCli.get_password("Enter a root password (blank for none)")
@@ -80,6 +85,47 @@ module CertificateAuthorityCli
     def show_csr(csr_path)
       ## Just use OpenSSL for this
       exec("openssl req -in #{csr_path} -text")
+    end
+
+    desc "sign_cert [CONFIG]", "Sign a new cert with a config"
+    def sign_cert(config_path)
+      config = Config.from_yaml(File.read(config_path))
+      config.command_specific = {"modulus" => 1024, "serial_number" => 2, "years_valid" => 1, "outfile" => "/tmp/temp.crt","outkey" => "/tmp/temp.key", "subject" => GENERIC_SUBJECT}
+
+      editor = Editor.new()
+      on_change = lambda { |new_content|
+        Log.debug new_content
+        Config.from_yaml(new_content)
+      }
+      new_config = editor.edit!(config.to_yaml,on_change)
+      config = new_config unless new_config.nil? ## User didn't do anything
+
+      x509_cert = OpenSSL::X509::Certificate.new File.read(config.signing_cert)
+      ca_cert = CertificateAuthority::Certificate.from_openssl(x509_cert)
+      key_material = CertificateAuthority::KeyMaterial.from_x509_key_pair(File.read(config.signing_key))
+      ca_cert.key_material = key_material
+      cert = CertificateAuthority::Certificate.new
+      cert.parent=ca_cert
+      cert.subject.ou= config.command_specific["subject"]["ou"]
+      cert.subject.common_name= config.command_specific["subject"]["cn"]
+      cert.serial_number.number= config.command_specific["serial_number"]
+      cert.key_material.generate_key(config.command_specific["modulus"])
+      if config.command_specific["years_valid"]
+        years = config.command_specific["years_valid"].to_i
+        cert.not_after = Time.now + 60 * 60 * 24 * 365 * years
+      end
+      if !config.signing_profile.nil?
+        Log.info "Signing cert with a signing profile"
+        new_cert = cert.sign!(config.signing_profile)
+      else
+        Log.info "Signing cert without a signing profile"
+        new_cert = cert.sign!
+      end
+
+      Log.info "Writing signed certificate to #{config.command_specific["outfile"]}"
+      Log.info "Writing private key to #{config.command_specific["outkey"]}"
+      File.open(config.command_specific["outfile"],"w") {|f| f.write(new_cert.to_pem)}
+      File.open(config.command_specific["outkey"],"w") {|f| f.write(cert.key_material.private_key.to_pem)}
     end
 
     desc "sign_csr [CONFIG] [CSR_PATH]", "Sign the CSR at CSR_PATH with CONFIG"
@@ -115,6 +161,39 @@ module CertificateAuthorityCli
 
       Log.info "Writing signed certificate to #{config.command_specific["outfile"]}"
       File.open(config.command_specific["outfile"],"w") {|f| f.write(new_cert.to_pem)}
+    end
+
+    desc "build_pkcs12 [CERT_PATH] [KEY_PATH] [OUT_PATH]", "Combine a certificate and a private key in a PKCS12"
+    def build_pkcs12(cert_path,key_path, out_path)
+      command = "openssl pkcs12 -export -in #{cert_path} -inkey #{key_path} -out #{out_path} -nodes"
+      puts "Executing #{command}"
+      system(command)
+    end
+
+    desc "add_jceks [CERT_PATH] [JCEKS_PATH]", "Take certs and build/append a JCEKS file"
+    def add_jceks(cert_path,jceks_path)
+      puts "Building JCEKS from #{cert_path}"
+      openssl_certificate = OpenSSL::X509::Certificate.new(File.read(cert_path))
+      certificate = CertificateAuthority::Certificate.from_openssl(openssl_certificate)
+      name_alias = certificate.distinguished_name.cn
+      command = "keytool -importcert -file #{cert_path} -alias #{name_alias} -keystore #{jceks_path} -noprompt -keypass 'CHANGE'"
+      puts "Executing #{command}"
+      system(command)
+    end
+
+    desc "add_p12_jceks [P12_PATH] [JCEKS_PATH]", "Import a PKCS12 to a JCEKS"
+    def add_p12_jceks(p12_path, jceks_path)
+     #keytool -alias 1
+     command = "keytool -importkeystore -destkeystore #{jceks_path} -srckeystore #{p12_path} -srcstoretype PKCS12"
+     puts "Executing #{command}"
+     system(command)
+    end
+
+    desc "list_jceks [JCEKS_PATH]", "List contents of a JCEKS"
+    def list_jceks(jceks_path)
+      command = "keytool -list -keystore #{jceks_path}"
+      puts "Executing #{command}"
+      system(command)
     end
   end
 
